@@ -460,6 +460,153 @@ fn test_fee_bearing_full_term_repayment_with_lp_withdrawal() {
     );
 }
 
+// Issue #105: the relay authenticates its caller, but cannot impersonate the pool.
+#[contract]
+pub struct UnrelatedEscrowRelay;
+
+#[contractimpl]
+impl UnrelatedEscrowRelay {
+    pub fn lock(
+        env: Env,
+        caller: Address,
+        escrow: Address,
+        id: BytesN<32>,
+        amount: u128,
+        issuer: Address,
+    ) {
+        caller.require_auth();
+        EscrowContractClient::new(&env, &escrow).lock(&id, &amount, &issuer);
+    }
+    pub fn release(env: Env, caller: Address, escrow: Address, id: BytesN<32>, issuer: Address) {
+        caller.require_auth();
+        EscrowContractClient::new(&env, &escrow).release_to_issuer(&id, &issuer);
+    }
+}
+
+#[test]
+fn test_unrelated_account_and_relay_cannot_lock_or_release_escrow() {
+    use soroban_sdk::{
+        testutils::{MockAuth, MockAuthInvoke},
+        IntoVal,
+    };
+    let lifecycle = setup_fee_lifecycle();
+    lifecycle.pool.deposit(&lifecycle.lp, &12_000_000_000);
+    let (funded_id, _) = create_fee_lifecycle_invoice(&lifecycle);
+    let fresh_id = BytesN::from_array(&lifecycle.env, &[89; 32]);
+    let escrow = EscrowContractClient::new(&lifecycle.env, &lifecycle.escrow_id);
+    let attacker = Address::generate(&lifecycle.env);
+    let relay_id = lifecycle.env.register_contract(None, UnrelatedEscrowRelay);
+    let relay = UnrelatedEscrowRelayClient::new(&lifecycle.env, &relay_id);
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    let balances = (
+        token.balance(&lifecycle.pool_id),
+        token.balance(&lifecycle.escrow_id),
+        token.balance(&lifecycle.issuer),
+    );
+    let locked = escrow.get_locked(&funded_id);
+    lifecycle.env.set_auths(&[]);
+    assert!(escrow
+        .mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &lifecycle.escrow_id,
+                fn_name: "lock",
+                args: (fresh_id.clone(), 100u128, lifecycle.issuer.clone())
+                    .into_val(&lifecycle.env),
+                sub_invokes: &[]
+            },
+        }])
+        .try_lock(&fresh_id, &100, &lifecycle.issuer)
+        .is_err());
+    assert!(escrow
+        .mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &lifecycle.escrow_id,
+                fn_name: "release_to_issuer",
+                args: (funded_id.clone(), lifecycle.issuer.clone()).into_val(&lifecycle.env),
+                sub_invokes: &[]
+            },
+        }])
+        .try_release_to_issuer(&funded_id, &lifecycle.issuer)
+        .is_err());
+    assert!(relay
+        .mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &relay_id,
+                fn_name: "lock",
+                args: (
+                    attacker.clone(),
+                    lifecycle.escrow_id.clone(),
+                    fresh_id.clone(),
+                    100u128,
+                    lifecycle.issuer.clone()
+                )
+                    .into_val(&lifecycle.env),
+                sub_invokes: &[]
+            },
+        }])
+        .try_lock(
+            &attacker,
+            &lifecycle.escrow_id,
+            &fresh_id,
+            &100,
+            &lifecycle.issuer
+        )
+        .is_err());
+    assert!(relay
+        .mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &relay_id,
+                fn_name: "release",
+                args: (
+                    attacker.clone(),
+                    lifecycle.escrow_id.clone(),
+                    funded_id.clone(),
+                    lifecycle.issuer.clone()
+                )
+                    .into_val(&lifecycle.env),
+                sub_invokes: &[]
+            },
+        }])
+        .try_release(
+            &attacker,
+            &lifecycle.escrow_id,
+            &funded_id,
+            &lifecycle.issuer
+        )
+        .is_err());
+    assert_eq!(
+        (
+            token.balance(&lifecycle.pool_id),
+            token.balance(&lifecycle.escrow_id),
+            token.balance(&lifecycle.issuer)
+        ),
+        balances
+    );
+    assert_eq!(escrow.get_locked(&funded_id), locked);
+    assert_eq!(escrow.get_locked(&fresh_id), 0);
+    // Narrow positive control: authorizing the configured pool succeeds.
+    assert!(escrow
+        .mock_auths(&[MockAuth {
+            address: &lifecycle.pool_id,
+            invoke: &MockAuthInvoke {
+                contract: &lifecycle.escrow_id,
+                fn_name: "release_to_issuer",
+                args: (funded_id.clone(), lifecycle.issuer.clone()).into_val(&lifecycle.env),
+                sub_invokes: &[]
+            },
+        }])
+        .release_to_issuer(&funded_id, &lifecycle.issuer));
+    assert_eq!(escrow.get_locked(&funded_id), 0);
+    assert_eq!(
+        token.balance(&lifecycle.issuer),
+        balances.2 + locked as i128
+    );
+}
+
 #[test]
 #[should_panic]
 fn test_cross_contract_unauthorized_pool_setter_rejected() {
@@ -1018,151 +1165,4 @@ fn test_partial_repayment_then_default_pool_loss_calculation() {
     // 16. LP withdrawal should reflect correct principal after loss
     let returned = pool.withdraw(&lp, &shares);
     assert_eq!(returned, deposit_amount - expected_loss);
-}
-
-// Issue #105: the relay authenticates its caller, but cannot impersonate the pool.
-#[contract]
-pub struct UnrelatedEscrowRelay;
-
-#[contractimpl]
-impl UnrelatedEscrowRelay {
-    pub fn lock(
-        env: Env,
-        caller: Address,
-        escrow: Address,
-        id: BytesN<32>,
-        amount: u128,
-        issuer: Address,
-    ) {
-        caller.require_auth();
-        EscrowContractClient::new(&env, &escrow).lock(&id, &amount, &issuer);
-    }
-    pub fn release(env: Env, caller: Address, escrow: Address, id: BytesN<32>, issuer: Address) {
-        caller.require_auth();
-        EscrowContractClient::new(&env, &escrow).release_to_issuer(&id, &issuer);
-    }
-}
-
-#[test]
-fn test_unrelated_account_and_relay_cannot_lock_or_release_escrow() {
-    use soroban_sdk::{
-        testutils::{MockAuth, MockAuthInvoke},
-        IntoVal,
-    };
-    let lifecycle = setup_fee_lifecycle();
-    lifecycle.pool.deposit(&lifecycle.lp, &12_000_000_000);
-    let (funded_id, _) = create_fee_lifecycle_invoice(&lifecycle);
-    let fresh_id = BytesN::from_array(&lifecycle.env, &[89; 32]);
-    let escrow = EscrowContractClient::new(&lifecycle.env, &lifecycle.escrow_id);
-    let attacker = Address::generate(&lifecycle.env);
-    let relay_id = lifecycle.env.register_contract(None, UnrelatedEscrowRelay);
-    let relay = UnrelatedEscrowRelayClient::new(&lifecycle.env, &relay_id);
-    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
-    let balances = (
-        token.balance(&lifecycle.pool_id),
-        token.balance(&lifecycle.escrow_id),
-        token.balance(&lifecycle.issuer),
-    );
-    let locked = escrow.get_locked(&funded_id);
-    lifecycle.env.set_auths(&[]);
-    assert!(escrow
-        .mock_auths(&[MockAuth {
-            address: &attacker,
-            invoke: &MockAuthInvoke {
-                contract: &lifecycle.escrow_id,
-                fn_name: "lock",
-                args: (fresh_id.clone(), 100u128, lifecycle.issuer.clone())
-                    .into_val(&lifecycle.env),
-                sub_invokes: &[]
-            },
-        }])
-        .try_lock(&fresh_id, &100, &lifecycle.issuer)
-        .is_err());
-    assert!(escrow
-        .mock_auths(&[MockAuth {
-            address: &attacker,
-            invoke: &MockAuthInvoke {
-                contract: &lifecycle.escrow_id,
-                fn_name: "release_to_issuer",
-                args: (funded_id.clone(), lifecycle.issuer.clone()).into_val(&lifecycle.env),
-                sub_invokes: &[]
-            },
-        }])
-        .try_release_to_issuer(&funded_id, &lifecycle.issuer)
-        .is_err());
-    assert!(relay
-        .mock_auths(&[MockAuth {
-            address: &attacker,
-            invoke: &MockAuthInvoke {
-                contract: &relay_id,
-                fn_name: "lock",
-                args: (
-                    attacker.clone(),
-                    lifecycle.escrow_id.clone(),
-                    fresh_id.clone(),
-                    100u128,
-                    lifecycle.issuer.clone()
-                )
-                    .into_val(&lifecycle.env),
-                sub_invokes: &[]
-            },
-        }])
-        .try_lock(
-            &attacker,
-            &lifecycle.escrow_id,
-            &fresh_id,
-            &100,
-            &lifecycle.issuer
-        )
-        .is_err());
-    assert!(relay
-        .mock_auths(&[MockAuth {
-            address: &attacker,
-            invoke: &MockAuthInvoke {
-                contract: &relay_id,
-                fn_name: "release",
-                args: (
-                    attacker.clone(),
-                    lifecycle.escrow_id.clone(),
-                    funded_id.clone(),
-                    lifecycle.issuer.clone()
-                )
-                    .into_val(&lifecycle.env),
-                sub_invokes: &[]
-            },
-        }])
-        .try_release(
-            &attacker,
-            &lifecycle.escrow_id,
-            &funded_id,
-            &lifecycle.issuer
-        )
-        .is_err());
-    assert_eq!(
-        (
-            token.balance(&lifecycle.pool_id),
-            token.balance(&lifecycle.escrow_id),
-            token.balance(&lifecycle.issuer)
-        ),
-        balances
-    );
-    assert_eq!(escrow.get_locked(&funded_id), locked);
-    assert_eq!(escrow.get_locked(&fresh_id), 0);
-    // Narrow positive control: authorizing the configured pool succeeds.
-    assert!(escrow
-        .mock_auths(&[MockAuth {
-            address: &lifecycle.pool_id,
-            invoke: &MockAuthInvoke {
-                contract: &lifecycle.escrow_id,
-                fn_name: "release_to_issuer",
-                args: (funded_id.clone(), lifecycle.issuer.clone()).into_val(&lifecycle.env),
-                sub_invokes: &[]
-            },
-        }])
-        .release_to_issuer(&funded_id, &lifecycle.issuer));
-    assert_eq!(escrow.get_locked(&funded_id), 0);
-    assert_eq!(
-        token.balance(&lifecycle.issuer),
-        balances.2 + locked as i128
-    );
 }
